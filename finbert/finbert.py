@@ -421,6 +421,7 @@ class FinBert(object):
         global_step = 0
 
         self.validation_losses = []
+        self.training_losses = []
 
         # Training
         train_dataloader = self.get_loader(train_examples, 'train')
@@ -493,6 +494,10 @@ class FinBert(object):
                     self.scheduler.step()
                     self.optimizer.zero_grad()
                     global_step += 1
+
+            # Calculate average training loss for this epoch
+            avg_tr_loss = tr_loss / nb_tr_steps if nb_tr_steps > 0 else 0
+            self.training_losses.append(avg_tr_loss)
 
             # Validation
 

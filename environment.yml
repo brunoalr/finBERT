@@ -5,9 +5,11 @@ channels:
   - conda-forge
   - defaults
 dependencies:
+  - pip
   - jupyter
   - pandas
   - python=3.12.12
+  - matplotlib
   - numpy
   - nltk
   - tqdm
