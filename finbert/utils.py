@@ -65,13 +65,30 @@ class DataProcessor(object):
 
     @classmethod
     def _read_tsv(cls, input_file):
-        """Reads a tab separated value file."""
-        with open(input_file, "r") as f:
-            reader = csv.reader(f, delimiter="\t")
+        """Reads a tab separated value file or CSV file."""
+        # Determine delimiter based on file extension
+        if input_file.endswith('.csv'):
+            delimiter = ","
+        else:
+            delimiter = "\t"
+        
+        # Always use quotechar for proper handling of quoted fields
+        with open(input_file, "r", encoding='utf-8') as f:
+            reader = csv.reader(f, delimiter=delimiter, quotechar='"')
             lines = []
             for line in reader:
+                # Ensure all cells are strings (Python 3 strings are already unicode)
+                # For Python 2 compatibility, convert to unicode if needed
                 if sys.version_info[0] == 2:
-                    line = list(unicode(cell, 'utf-8') for cell in line)
+                    # Python 2: convert to unicode
+                    try:
+                        unicode_type = unicode  # noqa: F821
+                    except NameError:
+                        unicode_type = str
+                    line = [unicode_type(cell, 'utf-8') for cell in line]
+                else:
+                    # Python 3: ensure all cells are strings
+                    line = [str(cell) for cell in line]
                 lines.append(line)
         return lines
 
@@ -100,16 +117,98 @@ class FinSentProcessor(DataProcessor):
     def _create_examples(self, lines, set_type):
         """Creates examples for the training and dev sets."""
         examples = []
+        # Detect format from header row
+        has_header = len(lines) > 0
+        is_id_text_format = False
+        is_two_column_format = False
+        
+        if has_header:
+            header = lines[0] if lines else []
+            header_lower = [str(col).lower() for col in header]
+            
+            # Check if header is ID/index,text format (no label)
+            if len(header) == 2:
+                first_col = header_lower[0]
+                second_col = header_lower[1]
+                if (first_col in ['id', 'index'] and 
+                    second_col == 'text'):
+                    is_id_text_format = True
+                # Check if header suggests 2-column format (sentence/text, sentiment/label)
+                elif (any('sentence' in col or 'text' in col for col in header_lower) and
+                      any('sentiment' in col or 'label' in col for col in header_lower)):
+                    is_two_column_format = True
+        
         for (i, line) in enumerate(lines):
             if i == 0:
+                continue  # Skip header row
+            # Skip empty lines
+            if not line:
+                logger.warning(f"Skipping line {i+1}: empty line")
                 continue
+            
             guid = "%s-%s" % (set_type, str(i))
-            text = line[1]
-            label = line[2]
-            try:
-                agree = line[3]
-            except:
+            
+            # Handle different column formats
+            if is_id_text_format:
+                # ID,text format: column 0 = ID, column 1 = text (no label)
+                if len(line) < 2:
+                    logger.warning(
+                        f"Skipping line {i+1}: insufficient columns "
+                        f"(expected at least 2, got {len(line)})")
+                    continue
+                text = line[1].strip() if len(line) > 1 else ""
+                label = None  # No label in this format
                 agree = None
+            elif is_two_column_format:
+                # 2-column format: column 0 = text, column 1 = label
+                if len(line) < 2:
+                    logger.warning(
+                        f"Skipping line {i+1}: insufficient columns "
+                        f"(expected at least 2, got {len(line)})")
+                    continue
+                text = line[0].strip() if len(line) > 0 else ""
+                label = line[1].strip() if len(line) > 1 else ""
+                agree = None
+            elif len(line) == 2:
+                # Fallback: if we have 2 columns but format is unknown,
+                # check if first column looks like an ID (numeric or short)
+                # and second looks like text (longer string)
+                col0 = line[0].strip() if len(line) > 0 else ""
+                col1 = line[1].strip() if len(line) > 1 else ""
+                # If first column is numeric or very short, treat as ID,text
+                if (col0.isdigit() or len(col0) < 10) and len(col1) > len(col0):
+                    text = col1
+                    label = None
+                else:
+                    # Otherwise assume text,label format
+                    text = col0
+                    label = col1
+                agree = None
+            else:
+                # 3+ column format: column 1 = text, column 2 = label
+                if len(line) < 3:
+                    logger.warning(
+                        f"Skipping line {i+1}: insufficient columns "
+                        f"(expected at least 3, got {len(line)})")
+                    continue
+                text = line[1].strip() if len(line) > 1 else ""
+                label = line[2].strip() if len(line) > 2 else ""
+                try:
+                    agree = line[3] if len(line) > 3 else None
+                except Exception:
+                    agree = None
+            
+            # Skip if text is empty
+            if not text:
+                logger.warning(f"Skipping line {i+1}: empty text")
+                continue
+            
+            # Allow examples without labels (for test/prediction data)
+            # Only skip if label is required but empty
+            if label is not None and not label:
+                logger.warning(f"Skipping line {i+1}: empty label")
+                continue
+            
             examples.append(
                 InputExample(guid=guid, text=text, label=label, agree=agree))
         return examples
@@ -142,6 +241,11 @@ def convert_examples_to_features(examples, label_list, max_seq_length, tokenizer
     if mode == 'classification':
         label_map = {label: i for i, label in enumerate(label_list)}
         label_map[None] = 9090
+        # Log label_map for debugging (only first time)
+        if not hasattr(convert_examples_to_features, '_logged_label_map'):
+            logger.info(f"Label map: {label_map}")
+            logger.info(f"Label list: {label_list}")
+            convert_examples_to_features._logged_label_map = True
 
     features = []
     for (ex_index, example) in enumerate(examples):
@@ -171,9 +275,30 @@ def convert_examples_to_features(examples, label_list, max_seq_length, tokenizer
         assert len(token_type_ids) == max_seq_length
 
         if mode == 'classification':
-            label_id = label_map[example.label]
+            # Handle None labels (for test/prediction data without labels)
+            if example.label is None:
+                label_id = label_map[None]
+            else:
+                # Normalize label to lowercase for case-insensitive matching
+                label_normalized = example.label.strip().lower()
+                # Find matching label in label_list (case-insensitive)
+                matching_label = next((l for l in label_list if l.lower() == label_normalized), None)
+                if matching_label is not None:
+                    label_id = label_map[matching_label]
+                else:
+                    # Label not found, treat as None
+                    # Only log warning for first few mismatches to avoid spam
+                    if ex_index < 5:
+                        logger.warning(
+                            f"Label '{example.label}' (normalized: '{label_normalized}') "
+                            f"not found in label_list {label_list}, treating as None")
+                    label_id = label_map[None]
         elif mode == 'regression':
-            label_id = float(example.label)
+            # Handle None labels (for test/prediction data without labels)
+            if example.label is None:
+                label_id = 0.0  # Default value for regression
+            else:
+                label_id = float(example.label)
         else:
             raise ValueError("The mode should either be classification or regression. You entered: " + mode)
 

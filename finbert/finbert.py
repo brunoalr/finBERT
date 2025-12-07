@@ -3,22 +3,55 @@ from __future__ import absolute_import, division, print_function
 import random
 
 import pandas as pd
+import torch
 from torch.nn import MSELoss, CrossEntropyLoss
 from torch.utils.data import (DataLoader, RandomSampler, SequentialSampler,
     TensorDataset)
 from tqdm import tqdm_notebook as tqdm
 from tqdm import trange
 from nltk.tokenize import sent_tokenize
+import nltk
+
+# Download punkt_tab if not already downloaded
+try:
+    nltk.data.find('tokenizers/punkt_tab')
+except LookupError:
+    nltk.download('punkt_tab', quiet=True)
 from finbert.utils import *
 import numpy as np
 import logging
 
-from transformers.optimization import AdamW, get_linear_schedule_with_warmup
+from torch.optim import AdamW
+from transformers.optimization import get_linear_schedule_with_warmup
 from transformers import AutoTokenizer
 
 logger = logging.getLogger(__name__)
 
 tokenizer = AutoTokenizer.from_pretrained('bert-base-uncased')
+
+
+def get_device(no_cuda=False):
+    """
+    Get the best available device for PyTorch operations.
+    Priority: CUDA > MPS > CPU
+
+    Parameters
+    ----------
+    no_cuda: bool
+        If True, skip CUDA even if available (default: False)
+
+    Returns
+    -------
+    torch.device
+        The best available device
+    """
+    if not no_cuda and torch.cuda.is_available():
+        return torch.device("cuda")
+    elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available() and torch.backends.mps.is_built():
+        return torch.device("mps")
+    else:
+        return torch.device("cpu")
+
 
 class Config(object):
     """The configuration class for training."""
@@ -139,8 +172,14 @@ class FinBert(object):
         }
 
         if self.config.local_rank == -1 or self.config.no_cuda:
-            self.device = torch.device("cuda" if torch.cuda.is_available() and not self.config.no_cuda else "cpu")
-            self.n_gpu = torch.cuda.device_count()
+            self.device = get_device(self.config.no_cuda)
+            # For CUDA, count devices; for MPS, there's only one device; for CPU, zero
+            if self.device.type == "cuda":
+                self.n_gpu = torch.cuda.device_count()
+            elif self.device.type == "mps":
+                self.n_gpu = 1
+            else:
+                self.n_gpu = 0
         else:
             torch.cuda.set_device(self.config.local_rank)
             self.device = torch.device("cuda", self.config.local_rank)
@@ -160,7 +199,7 @@ class FinBert(object):
         np.random.seed(self.config.seed)
         torch.manual_seed(self.config.seed)
 
-        if self.n_gpu > 0:
+        if self.device.type == "cuda" and self.n_gpu > 0:
             torch.cuda.manual_seed_all(self.config.seed)
 
         if os.path.exists(self.config.model_dir) and os.listdir(self.config.model_dir):
@@ -189,6 +228,12 @@ class FinBert(object):
             A list of InputExample's. Each InputExample is an object that includes the information for each example;
             text, id, label...
         """
+        # Check if prepare_model has been called
+        if not hasattr(self, 'processor') or self.processor is None:
+            raise AttributeError(
+                "The 'processor' attribute is not initialized. "
+                "Please call 'finbert.prepare_model(label_list)' first before calling 'get_data()'."
+            )
 
         self.num_train_optimization_steps = None
         examples = None
@@ -198,11 +243,22 @@ class FinBert(object):
                 examples) / self.config.train_batch_size / self.config.gradient_accumulation_steps) * self.config.num_train_epochs
 
         if phase == 'train':
-            train = pd.read_csv(os.path.join(self.config.data_dir, 'train.csv'), sep='\t', index_col=False)
+            # Try to detect CSV vs TSV format
+            train_path = os.path.join(self.config.data_dir, 'train.csv')
+            # Read first line to detect delimiter
+            with open(train_path, 'r', encoding='utf-8') as f:
+                first_line = f.readline()
+                delimiter = ',' if ',' in first_line else '\t'
+            
+            train = pd.read_csv(train_path, sep=delimiter, index_col=False)
             weights = list()
             labels = self.label_list
 
-            class_weights = [train.shape[0] / train[train.label == label].shape[0] for label in labels]
+            # Use bracket notation to access column (more robust)
+            if 'label' not in train.columns:
+                raise ValueError(f"Column 'label' not found in train.csv. Available columns: {train.columns.tolist()}")
+            
+            class_weights = [train.shape[0] / train[train['label'] == label].shape[0] for label in labels]
             self.class_weights = torch.tensor(class_weights)
 
         return examples
@@ -283,8 +339,7 @@ class FinBert(object):
         self.num_warmup_steps = int(float(self.num_train_optimization_steps) * self.config.warm_up_proportion)
 
         self.optimizer = AdamW(optimizer_grouped_parameters,
-                          lr=self.config.learning_rate,
-                          correct_bias=False)
+                          lr=self.config.learning_rate)
 
         self.scheduler = get_linear_schedule_with_warmup(self.optimizer,
                                                     num_warmup_steps=self.num_warmup_steps,
@@ -536,7 +591,8 @@ class FinBert(object):
                 logits = model(input_ids, attention_mask, token_type_ids)[0]
 
                 if self.config.output_mode == "classification":
-                    loss_fct = CrossEntropyLoss()
+                    # Use ignore_index=9090 to ignore None labels (placeholder for missing labels)
+                    loss_fct = CrossEntropyLoss(ignore_index=9090)
                     tmp_eval_loss = loss_fct(logits.view(-1, self.num_labels), label_ids.view(-1))
                 elif self.config.output_mode == "regression":
                     loss_fct = MSELoss()
@@ -600,9 +656,25 @@ def predict(text, model, write_to_csv=False, path=None, use_gpu=False, gpu_name=
     """
     model.eval()
 
+    # Ensure punkt_tab is available
+    try:
+        nltk.data.find('tokenizers/punkt_tab')
+    except LookupError:
+        logger.info("Downloading NLTK punkt_tab tokenizer...")
+        nltk.download('punkt_tab', quiet=True)
+    
     sentences = sent_tokenize(text)
 
-    device = gpu_name if use_gpu and torch.cuda.is_available() else "cpu"
+    if use_gpu:
+        # Use the helper function to get the best available device
+        device_obj = get_device(no_cuda=False)
+        # If user specified a specific GPU name and we're using CUDA, use that
+        if device_obj.type == "cuda" and gpu_name.startswith("cuda"):
+            device = gpu_name
+        else:
+            device = str(device_obj)
+    else:
+        device = "cpu"
     logging.info("Using device: %s " % device)
     label_list = ['positive', 'negative', 'neutral']
     label_dict = {0: 'positive', 1: 'negative', 2: 'neutral'}
