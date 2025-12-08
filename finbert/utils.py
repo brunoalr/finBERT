@@ -66,11 +66,17 @@ class DataProcessor(object):
     @classmethod
     def _read_tsv(cls, input_file):
         """Reads a tab separated value file or CSV file."""
-        # Determine delimiter based on file extension
-        if input_file.endswith('.csv'):
-            delimiter = ","
-        else:
-            delimiter = "\t"
+        # Auto-detect delimiter by reading first line
+        delimiter = ","
+        with open(input_file, "r", encoding='utf-8') as f:
+            first_line = f.readline()
+            # Count tabs vs commas in first line
+            tab_count = first_line.count('\t')
+            comma_count = first_line.count(',')
+            # Use tab if there are more tabs than commas, or if no commas but tabs exist
+            if tab_count > comma_count or (comma_count == 0 and tab_count > 0):
+                delimiter = "\t"
+            f.seek(0)  # Reset to beginning
         
         # Always use quotechar for proper handling of quoted fields
         with open(input_file, "r", encoding='utf-8') as f:
@@ -279,8 +285,14 @@ def convert_examples_to_features(examples, label_list, max_seq_length, tokenizer
             if example.label is None:
                 label_id = label_map[None]
             else:
+                # Clean label: remove tabs, newlines, extra whitespace
+                label_cleaned = example.label.strip()
+                # Remove any tab characters that might have been included
+                label_cleaned = label_cleaned.replace('\t', ' ').replace('\n', ' ').replace('\r', ' ')
+                # Collapse multiple spaces
+                label_cleaned = ' '.join(label_cleaned.split())
                 # Normalize label to lowercase for case-insensitive matching
-                label_normalized = example.label.strip().lower()
+                label_normalized = label_cleaned.lower()
                 # Find matching label in label_list (case-insensitive)
                 matching_label = next((l for l in label_list if l.lower() == label_normalized), None)
                 if matching_label is not None:
@@ -290,7 +302,7 @@ def convert_examples_to_features(examples, label_list, max_seq_length, tokenizer
                     # Only log warning for first few mismatches to avoid spam
                     if ex_index < 5:
                         logger.warning(
-                            f"Label '{example.label}' (normalized: '{label_normalized}') "
+                            f"Label '{example.label}' (cleaned: '{label_cleaned}', normalized: '{label_normalized}') "
                             f"not found in label_list {label_list}, treating as None")
                     label_id = label_map[None]
         elif mode == 'regression':

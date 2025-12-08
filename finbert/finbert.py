@@ -258,8 +258,29 @@ class FinBert(object):
             if 'label' not in train.columns:
                 raise ValueError(f"Column 'label' not found in train.csv. Available columns: {train.columns.tolist()}")
             
-            class_weights = [train.shape[0] / train[train['label'] == label].shape[0] for label in labels]
-            self.class_weights = torch.tensor(class_weights)
+            # Calculate class weights with safeguards
+            class_weights = []
+            for label in labels:
+                label_count = train[train['label'] == label].shape[0]
+                if label_count == 0:
+                    logger.warning(f"Label '{label}' not found in training data! Using weight 1.0")
+                    class_weights.append(1.0)
+                else:
+                    weight = train.shape[0] / label_count
+                    if np.isnan(weight) or np.isinf(weight):
+                        logger.warning(f"Invalid weight calculated for label '{label}': {weight}. Using weight 1.0")
+                        class_weights.append(1.0)
+                    else:
+                        class_weights.append(weight)
+            
+            self.class_weights = torch.tensor(class_weights, dtype=torch.float32)
+            
+            # Verify class weights are valid
+            if torch.isnan(self.class_weights).any() or torch.isinf(self.class_weights).any():
+                logger.error(f"Invalid class weights detected: {self.class_weights}. Using uniform weights.")
+                self.class_weights = torch.ones(len(labels), dtype=torch.float32)
+            
+            logger.info(f"Class weights: {self.class_weights}")
 
         return examples
 
@@ -426,6 +447,17 @@ class FinBert(object):
         # Training
         train_dataloader = self.get_loader(train_examples, 'train')
 
+        # Check model parameters for NaN/Inf before training
+        has_nan_params = False
+        for name, param in model.named_parameters():
+            if param.requires_grad:
+                if torch.isnan(param).any() or torch.isinf(param).any():
+                    logger.error(f"Model parameter '{name}' contains NaN or Inf before training!")
+                    has_nan_params = True
+        if has_nan_params:
+            logger.error("Model contains NaN/Inf parameters. This will cause training to fail. "
+                        "Consider reinitializing the model or checking the pretrained weights.")
+
         model.train()
 
         step_number = len(train_dataloader)
@@ -466,14 +498,68 @@ class FinBert(object):
                 input_ids, attention_mask, token_type_ids, label_ids, agree_ids = batch
 
                 logits = model(input_ids, attention_mask, token_type_ids)[0]
+                
+                # Check for NaN or Inf in logits during training
+                skip_batch = False
+                if torch.isnan(logits).any() or torch.isinf(logits).any():
+                    nan_count = torch.isnan(logits).sum().item()
+                    inf_count = torch.isinf(logits).sum().item()
+                    logger.warning(f"NaN or Inf detected in training logits! NaN: {nan_count}, Inf: {inf_count}. Skipping batch.")
+                    skip_batch = True
+                
+                # Check for extreme logit values that could cause numerical instability
+                if not skip_batch:
+                    logit_max = logits.max().item()
+                    logit_min = logits.min().item()
+                    if abs(logit_max) > 100 or abs(logit_min) > 100:
+                        logger.warning(f"Extreme logit values detected: min={logit_min:.2f}, max={logit_max:.2f}. "
+                                     f"This may cause numerical instability. Clipping logits.")
+                        logits = torch.clamp(logits, min=-100, max=100)
+                
                 weights = self.class_weights.to(self.device)
+                
+                # Check for invalid label_ids (9090 is the ignore index, shouldn't be in training)
+                if not skip_batch and (label_ids == 9090).any():
+                    invalid_count = (label_ids == 9090).sum().item()
+                    total_count = label_ids.size(0)
+                    if invalid_count == total_count:
+                        logger.warning(f"All {total_count} labels in batch are invalid (9090). Skipping batch.")
+                        skip_batch = True
+                    else:
+                        logger.warning(f"Found {invalid_count}/{total_count} invalid label_ids (9090) in training batch. "
+                                     f"These will be ignored in loss calculation.")
 
-                if self.config.output_mode == "classification":
-                    loss_fct = CrossEntropyLoss(weight=weights)
-                    loss = loss_fct(logits.view(-1, self.num_labels), label_ids.view(-1))
-                elif self.config.output_mode == "regression":
-                    loss_fct = MSELoss()
-                    loss = loss_fct(logits.view(-1), label_ids.view(-1))
+                if not skip_batch:
+                    if self.config.output_mode == "classification":
+                        # Verify weights are valid
+                        if torch.isnan(weights).any() or torch.isinf(weights).any():
+                            logger.error(f"Invalid class weights detected: {weights}. Using uniform weights.")
+                            weights = torch.ones(self.num_labels, dtype=torch.float32).to(self.device)
+                        
+                        # Use ignore_index=9090 to ignore invalid labels
+                        loss_fct = CrossEntropyLoss(weight=weights, ignore_index=9090)
+                        loss = loss_fct(logits.view(-1, self.num_labels), label_ids.view(-1))
+                        
+                        # Check if loss is NaN or Inf
+                        if torch.isnan(loss) or torch.isinf(loss):
+                            logger.warning(f"NaN or Inf detected in training loss! Loss value: {loss.item()}. "
+                                         f"Logits range: [{logits.min().item():.4f}, {logits.max().item():.4f}], "
+                                         f"Label IDs: {label_ids.unique().tolist()}, "
+                                         f"Weights: {weights.tolist()}")
+                            skip_batch = True
+                    elif self.config.output_mode == "regression":
+                        loss_fct = MSELoss()
+                        loss = loss_fct(logits.view(-1), label_ids.view(-1))
+                        if torch.isnan(loss) or torch.isinf(loss):
+                            logger.warning(f"NaN or Inf detected in training loss! Loss value: {loss.item()}. Skipping batch.")
+                            skip_batch = True
+
+                if skip_batch:
+                    # Skip this batch but still update counters for gradient accumulation
+                    if (step + 1) % self.config.gradient_accumulation_steps == 0:
+                        # Zero gradients to maintain consistency
+                        self.optimizer.zero_grad()
+                    continue
 
                 if self.config.gradient_accumulation_steps > 1:
                     loss = loss / self.config.gradient_accumulation_steps
@@ -507,6 +593,9 @@ class FinBert(object):
             valid_loss, valid_accuracy = 0, 0
             nb_valid_steps, nb_valid_examples = 0, 0
 
+            # Define weights for validation (same as training)
+            weights = self.class_weights.to(self.device)
+
             for input_ids, attention_mask, token_type_ids, label_ids, agree_ids in tqdm(validation_loader, desc="Validating"):
                 input_ids = input_ids.to(self.device)
                 attention_mask = attention_mask.to(self.device)
@@ -516,16 +605,31 @@ class FinBert(object):
 
                 with torch.no_grad():
                     logits = model(input_ids, attention_mask, token_type_ids)[0]
+                    
+                    # Check for NaN or Inf in logits
+                    if torch.isnan(logits).any() or torch.isinf(logits).any():
+                        logger.warning("NaN or Inf detected in validation logits!")
+                        logger.warning(f"NaN count: {torch.isnan(logits).sum().item()}, Inf count: {torch.isinf(logits).sum().item()}")
+                        # Skip this batch or use a fallback
+                        continue
 
                     if self.config.output_mode == "classification":
                         loss_fct = CrossEntropyLoss(weight=weights)
                         tmp_valid_loss = loss_fct(logits.view(-1, self.num_labels), label_ids.view(-1))
+                        
+                        # Check if loss is NaN or Inf
+                        if torch.isnan(tmp_valid_loss) or torch.isinf(tmp_valid_loss):
+                            logger.warning(f"NaN or Inf detected in validation loss! Loss value: {tmp_valid_loss.item()}")
+                            continue
                     elif self.config.output_mode == "regression":
                         loss_fct = MSELoss()
                         tmp_valid_loss = loss_fct(logits.view(-1), label_ids.view(-1))
+                        if torch.isnan(tmp_valid_loss) or torch.isinf(tmp_valid_loss):
+                            logger.warning(f"NaN or Inf detected in validation loss! Loss value: {tmp_valid_loss.item()}")
+                            continue
 
-                    valid_loss += tmp_valid_loss.mean().item()
-
+                    # tmp_valid_loss is already a scalar, so we can use .item() directly
+                    valid_loss += tmp_valid_loss.item()
                     nb_valid_steps += 1
 
             valid_loss = valid_loss / nb_valid_steps
