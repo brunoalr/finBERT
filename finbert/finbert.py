@@ -6,7 +6,7 @@ import pandas as pd
 import torch
 from torch.nn import MSELoss, CrossEntropyLoss
 from torch.utils.data import (DataLoader, RandomSampler, SequentialSampler,
-    TensorDataset)
+                              TensorDataset)
 from tqdm import tqdm_notebook as tqdm
 from tqdm import trange
 from nltk.tokenize import sent_tokenize
@@ -58,40 +58,26 @@ def check_tensor_valid(tensor, name="tensor"):
     if torch.isnan(tensor).any() or torch.isinf(tensor).any():
         nan_count = torch.isnan(tensor).sum().item()
         inf_count = torch.isinf(tensor).sum().item()
-        logger.warning(f"Invalid values in {name}: NaN={nan_count}, Inf={inf_count}")
+        logger.warning(
+            f"Invalid values in {name}: NaN={nan_count}, Inf={inf_count}")
         return False
     return True
 
 
 def safe_loss_calculation(logits, label_ids, weights, num_labels, output_mode, ignore_index=9090):
     """
-    Safely calculate loss with error checking.
-    
+    Calculate loss with basic error checking.
+
     Returns:
         tuple: (loss tensor or None, skip_batch bool)
     """
-    # Check logits
-    if not check_tensor_valid(logits, "logits"):
+    # Basic validity check for logits
+    if torch.isnan(logits).any() or torch.isinf(logits).any():
+        logger.warning("Invalid logits detected (NaN/Inf). Skipping batch.")
         return None, True
-    
-    # Clip extreme logit values
-    logit_max = logits.max().item()
-    logit_min = logits.min().item()
-    if abs(logit_max) > 100 or abs(logit_min) > 100:
-        logger.warning(f"Extreme logit values detected: [{logit_min:.2f}, {logit_max:.2f}]. Clipping.")
-        logits = torch.clamp(logits, min=-100, max=100)
-    
-    # Check for invalid labels (ignore_index)
-    if output_mode == "classification" and (label_ids == ignore_index).any():
-        invalid_count = (label_ids == ignore_index).sum().item()
-        if invalid_count == label_ids.size(0):
-            logger.warning(f"All labels are invalid (ignore_index={ignore_index}). Skipping batch.")
-            return None, True
-    
+
     # Calculate loss
     if output_mode == "classification":
-        if weights is not None and not check_tensor_valid(weights, "class_weights"):
-            weights = torch.ones(num_labels, dtype=torch.float32).to(weights.device)
         loss_fct = CrossEntropyLoss(weight=weights, ignore_index=ignore_index)
         loss = loss_fct(logits.view(-1, num_labels), label_ids.view(-1))
     elif output_mode == "regression":
@@ -99,12 +85,13 @@ def safe_loss_calculation(logits, label_ids, weights, num_labels, output_mode, i
         loss = loss_fct(logits.view(-1), label_ids.view(-1))
     else:
         raise ValueError(f"Unknown output_mode: {output_mode}")
-    
-    # Check loss validity
+
+    # Check if loss is valid (PyTorch will handle ignore_index internally)
     if torch.isnan(loss) or torch.isinf(loss):
-        logger.warning(f"Invalid loss detected: {loss.item()}")
+        logger.warning(
+            f"Invalid loss detected: {loss.item()}. Skipping batch.")
         return None, True
-    
+
     return loss, False
 
 
@@ -258,7 +245,8 @@ class FinBert(object):
             torch.cuda.manual_seed_all(self.config.seed)
 
         if os.path.exists(self.config.model_dir) and os.listdir(self.config.model_dir):
-            raise ValueError("Output directory ({}) already exists and is not empty.".format(self.config.model_dir))
+            raise ValueError("Output directory ({}) already exists and is not empty.".format(
+                self.config.model_dir))
         if not os.path.exists(self.config.model_dir):
             os.makedirs(self.config.model_dir)
 
@@ -266,7 +254,8 @@ class FinBert(object):
         self.num_labels = len(label_list)
         self.label_list = label_list
 
-        self.tokenizer = AutoTokenizer.from_pretrained(self.config.base_model, do_lower_case=self.config.do_lower_case)
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            self.config.base_model, do_lower_case=self.config.do_lower_case)
 
     def get_data(self, phase):
         """
@@ -302,32 +291,38 @@ class FinBert(object):
             train_path = os.path.join(self.config.data_dir, 'train.csv')
             with open(train_path, 'r', encoding='utf-8') as f:
                 delimiter = ',' if ',' in f.readline() else '\t'
-            
+
             train = pd.read_csv(train_path, sep=delimiter, index_col=False)
-            
+
             if 'label' not in train.columns:
-                raise ValueError(f"Column 'label' not found in train.csv. Available columns: {train.columns.tolist()}")
-            
+                raise ValueError(
+                    f"Column 'label' not found in train.csv. Available columns: {train.columns.tolist()}")
+
             # Calculate class weights
             class_weights = []
             for label in self.label_list:
                 label_count = train[train['label'] == label].shape[0]
                 if label_count == 0:
-                    logger.warning(f"Label '{label}' not found in training data. Using weight 1.0")
+                    logger.warning(
+                        f"Label '{label}' not found in training data. Using weight 1.0")
                     class_weights.append(1.0)
                 else:
                     weight = train.shape[0] / label_count
                     if np.isnan(weight) or np.isinf(weight):
-                        logger.warning(f"Invalid weight for label '{label}'. Using weight 1.0")
+                        logger.warning(
+                            f"Invalid weight for label '{label}'. Using weight 1.0")
                         class_weights.append(1.0)
                     else:
                         class_weights.append(weight)
-            
-            self.class_weights = torch.tensor(class_weights, dtype=torch.float32)
+
+            self.class_weights = torch.tensor(
+                class_weights, dtype=torch.float32)
             if not check_tensor_valid(self.class_weights, "class_weights"):
-                logger.error("Invalid class weights detected. Using uniform weights.")
-                self.class_weights = torch.ones(len(self.label_list), dtype=torch.float32)
-            
+                logger.error(
+                    "Invalid class weights detected. Using uniform weights.")
+                self.class_weights = torch.ones(
+                    len(self.label_list), dtype=torch.float32)
+
             logger.info(f"Class weights: {self.class_weights}")
 
         return examples
@@ -392,27 +387,27 @@ class FinBert(object):
 
             optimizer_grouped_parameters.extend(encoder_params)
 
-
         else:
             param_optimizer = list(model.named_parameters())
 
             optimizer_grouped_parameters = [
                 {'params': [p for n, p in param_optimizer if not any(nd in n for nd in no_decay)],
                  'weight_decay': 0.01},
-                {'params': [p for n, p in param_optimizer if any(nd in n for nd in no_decay)], 'weight_decay': 0.0}
+                {'params': [p for n, p in param_optimizer if any(
+                    nd in n for nd in no_decay)], 'weight_decay': 0.0}
             ]
 
         schedule = "warmup_linear"
 
-
-        self.num_warmup_steps = int(float(self.num_train_optimization_steps) * self.config.warm_up_proportion)
+        self.num_warmup_steps = int(
+            float(self.num_train_optimization_steps) * self.config.warm_up_proportion)
 
         self.optimizer = AdamW(optimizer_grouped_parameters,
-                          lr=self.config.learning_rate)
+                               lr=self.config.learning_rate)
 
         self.scheduler = get_linear_schedule_with_warmup(self.optimizer,
-                                                    num_warmup_steps=self.num_warmup_steps,
-                                                    num_training_steps=self.num_train_optimization_steps)
+                                                         num_warmup_steps=self.num_warmup_steps,
+                                                         num_training_steps=self.num_train_optimization_steps)
 
         return model
 
@@ -443,21 +438,29 @@ class FinBert(object):
         logger.info("  Num steps = %d", self.num_train_optimization_steps)
 
         # Load the data, make it into TensorDataset
-        all_input_ids = torch.tensor([f.input_ids for f in features], dtype=torch.long)
-        all_attention_mask = torch.tensor([f.attention_mask for f in features], dtype=torch.long)
-        all_token_type_ids = torch.tensor([f.token_type_ids for f in features], dtype=torch.long)
+        all_input_ids = torch.tensor(
+            [f.input_ids for f in features], dtype=torch.long)
+        all_attention_mask = torch.tensor(
+            [f.attention_mask for f in features], dtype=torch.long)
+        all_token_type_ids = torch.tensor(
+            [f.token_type_ids for f in features], dtype=torch.long)
 
         if self.config.output_mode == "classification":
-            all_label_ids = torch.tensor([f.label_id for f in features], dtype=torch.long)
+            all_label_ids = torch.tensor(
+                [f.label_id for f in features], dtype=torch.long)
         elif self.config.output_mode == "regression":
-            all_label_ids = torch.tensor([f.label_id for f in features], dtype=torch.float)
+            all_label_ids = torch.tensor(
+                [f.label_id for f in features], dtype=torch.float)
 
         try:
-            all_agree_ids = torch.tensor([f.agree for f in features], dtype=torch.long)
+            all_agree_ids = torch.tensor(
+                [f.agree for f in features], dtype=torch.long)
         except:
-            all_agree_ids = torch.tensor([0.0 for f in features], dtype=torch.long)
+            all_agree_ids = torch.tensor(
+                [0.0 for f in features], dtype=torch.long)
 
-        data = TensorDataset(all_input_ids, all_attention_mask, all_token_type_ids, all_label_ids, all_agree_ids)
+        data = TensorDataset(all_input_ids, all_attention_mask,
+                             all_token_type_ids, all_label_ids, all_agree_ids)
 
         # Distributed, if necessary
         if phase == 'train':
@@ -465,7 +468,8 @@ class FinBert(object):
         elif phase == 'eval':
             my_sampler = SequentialSampler(data)
 
-        dataloader = DataLoader(data, sampler=my_sampler, batch_size=self.config.train_batch_size)
+        dataloader = DataLoader(data, sampler=my_sampler,
+                                batch_size=self.config.train_batch_size)
         return dataloader
 
     def train(self, train_examples, model):
@@ -499,7 +503,8 @@ class FinBert(object):
         # Check model parameters for NaN/Inf before training
         for name, param in model.named_parameters():
             if param.requires_grad and not check_tensor_valid(param, f"parameter '{name}'"):
-                logger.error("Model contains invalid parameters. Check pretrained weights.")
+                logger.error(
+                    "Model contains invalid parameters. Check pretrained weights.")
 
         model.train()
 
@@ -540,14 +545,15 @@ class FinBert(object):
                 input_ids, attention_mask, token_type_ids, label_ids, agree_ids = batch
 
                 logits = model(input_ids, attention_mask, token_type_ids)[0]
-                weights = self.class_weights.to(self.device) if self.config.output_mode == "classification" else None
-                
+                weights = self.class_weights.to(
+                    self.device) if self.config.output_mode == "classification" else None
+
                 # Calculate loss with error checking
                 loss, skip_batch = safe_loss_calculation(
-                    logits, label_ids, weights, self.num_labels, 
+                    logits, label_ids, weights, self.num_labels,
                     self.config.output_mode, ignore_index=9090
                 )
-                
+
                 if skip_batch:
                     if (step + 1) % self.config.gradient_accumulation_steps == 0:
                         self.optimizer.zero_grad()
@@ -578,27 +584,31 @@ class FinBert(object):
             self.training_losses.append(avg_tr_loss)
 
             # Validation
-            validation_loader = self.get_loader(validation_examples, phase='eval')
+            validation_loader = self.get_loader(
+                validation_examples, phase='eval')
             model.eval()
 
             valid_loss = 0
             nb_valid_steps = 0
-            weights = self.class_weights.to(self.device) if self.config.output_mode == "classification" else None
+            weights = self.class_weights.to(
+                self.device) if self.config.output_mode == "classification" else None
 
             for input_ids, attention_mask, token_type_ids, label_ids, agree_ids in tqdm(validation_loader, desc="Validating"):
-                batch = tuple(t.to(self.device) for t in (input_ids, attention_mask, token_type_ids, label_ids, agree_ids))
+                batch = tuple(t.to(self.device) for t in (
+                    input_ids, attention_mask, token_type_ids, label_ids, agree_ids))
                 input_ids, attention_mask, token_type_ids, label_ids, agree_ids = batch
 
                 with torch.no_grad():
-                    logits = model(input_ids, attention_mask, token_type_ids)[0]
+                    logits = model(input_ids, attention_mask,
+                                   token_type_ids)[0]
                     tmp_valid_loss, skip_batch = safe_loss_calculation(
                         logits, label_ids, weights, self.num_labels,
                         self.config.output_mode, ignore_index=9090
                     )
-                    
+
                     if skip_batch:
                         continue
-                    
+
                     valid_loss += tmp_valid_loss.item()
                     nb_valid_steps += 1
 
@@ -610,7 +620,8 @@ class FinBert(object):
             if valid_loss == min(self.validation_losses):
 
                 try:
-                    os.remove(self.config.model_dir / ('temporary' + str(best_model)))
+                    os.remove(self.config.model_dir /
+                              ('temporary' + str(best_model)))
                 except:
                     print('No best model found')
                 torch.save({'epoch': str(i), 'state_dict': model.state_dict()},
@@ -618,9 +629,11 @@ class FinBert(object):
                 best_model = i
 
         # Save a trained model and the associated configuration
-        checkpoint = torch.load(self.config.model_dir / ('temporary' + str(best_model)))
+        checkpoint = torch.load(
+            self.config.model_dir / ('temporary' + str(best_model)))
         model.load_state_dict(checkpoint['state_dict'])
-        model_to_save = model.module if hasattr(model, 'module') else model  # Only save the model it-self
+        model_to_save = model.module if hasattr(
+            model, 'module') else model  # Only save the model it-self
         output_model_file = os.path.join(self.config.model_dir, WEIGHTS_NAME)
         torch.save(model_to_save.state_dict(), output_model_file)
         output_config_file = os.path.join(self.config.model_dir, CONFIG_NAME)
@@ -672,10 +685,12 @@ class FinBert(object):
                 if self.config.output_mode == "classification":
                     # Use ignore_index=9090 to ignore None labels (placeholder for missing labels)
                     loss_fct = CrossEntropyLoss(ignore_index=9090)
-                    tmp_eval_loss = loss_fct(logits.view(-1, self.num_labels), label_ids.view(-1))
+                    tmp_eval_loss = loss_fct(
+                        logits.view(-1, self.num_labels), label_ids.view(-1))
                 elif self.config.output_mode == "regression":
                     loss_fct = MSELoss()
-                    tmp_eval_loss = loss_fct(logits.view(-1), label_ids.view(-1))
+                    tmp_eval_loss = loss_fct(
+                        logits.view(-1), label_ids.view(-1))
 
                 np_logits = logits.cpu().numpy()
 
@@ -708,7 +723,8 @@ class FinBert(object):
             # eval_loss += tmp_eval_loss.mean().item()
             # eval_accuracy += tmp_eval_accuracy
 
-        evaluation_df = pd.DataFrame({'predictions': predictions, 'labels': labels, "agree_levels": agree_levels})
+        evaluation_df = pd.DataFrame(
+            {'predictions': predictions, 'labels': labels, "agree_levels": agree_levels})
 
         return evaluation_df
 
@@ -741,7 +757,7 @@ def predict(text, model, write_to_csv=False, path=None, use_gpu=False, gpu_name=
     except LookupError:
         logger.info("Downloading NLTK punkt_tab tokenizer...")
         nltk.download('punkt_tab', quiet=True)
-    
+
     sentences = sent_tokenize(text)
 
     if use_gpu:
@@ -757,20 +773,27 @@ def predict(text, model, write_to_csv=False, path=None, use_gpu=False, gpu_name=
     logging.info("Using device: %s " % device)
     label_list = ['positive', 'negative', 'neutral']
     label_dict = {0: 'positive', 1: 'negative', 2: 'neutral'}
-    result = pd.DataFrame(columns=['sentence', 'logit', 'prediction', 'sentiment_score'])
+    result = pd.DataFrame(
+        columns=['sentence', 'logit', 'prediction', 'sentiment_score'])
     for batch in chunks(sentences, batch_size):
-        examples = [InputExample(str(i), sentence) for i, sentence in enumerate(batch)]
+        examples = [InputExample(str(i), sentence)
+                    for i, sentence in enumerate(batch)]
 
-        features = convert_examples_to_features(examples, label_list, 64, tokenizer)
+        features = convert_examples_to_features(
+            examples, label_list, 64, tokenizer)
 
-        all_input_ids = torch.tensor([f.input_ids for f in features], dtype=torch.long).to(device)
-        all_attention_mask = torch.tensor([f.attention_mask for f in features], dtype=torch.long).to(device)
-        all_token_type_ids = torch.tensor([f.token_type_ids for f in features], dtype=torch.long).to(device)
+        all_input_ids = torch.tensor(
+            [f.input_ids for f in features], dtype=torch.long).to(device)
+        all_attention_mask = torch.tensor(
+            [f.attention_mask for f in features], dtype=torch.long).to(device)
+        all_token_type_ids = torch.tensor(
+            [f.token_type_ids for f in features], dtype=torch.long).to(device)
 
         with torch.no_grad():
-            model     = model.to(device)
+            model = model.to(device)
 
-            logits = model(all_input_ids, all_attention_mask, all_token_type_ids)[0]
+            logits = model(all_input_ids, all_attention_mask,
+                           all_token_type_ids)[0]
             logging.info(logits)
             logits = softmax(np.array(logits.cpu()))
             sentiment_score = pd.Series(logits[:, 0] - logits[:, 1])
