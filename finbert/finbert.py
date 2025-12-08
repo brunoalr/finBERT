@@ -6,7 +6,7 @@ import pandas as pd
 import torch
 from torch.nn import MSELoss, CrossEntropyLoss
 from torch.utils.data import (DataLoader, RandomSampler, SequentialSampler,
-                              TensorDataset)
+    TensorDataset)
 from tqdm import tqdm_notebook as tqdm
 from tqdm import trange
 from nltk.tokenize import sent_tokenize
@@ -245,8 +245,7 @@ class FinBert(object):
             torch.cuda.manual_seed_all(self.config.seed)
 
         if os.path.exists(self.config.model_dir) and os.listdir(self.config.model_dir):
-            raise ValueError("Output directory ({}) already exists and is not empty.".format(
-                self.config.model_dir))
+            raise ValueError("Output directory ({}) already exists and is not empty.".format(self.config.model_dir))
         if not os.path.exists(self.config.model_dir):
             os.makedirs(self.config.model_dir)
 
@@ -254,8 +253,7 @@ class FinBert(object):
         self.num_labels = len(label_list)
         self.label_list = label_list
 
-        self.tokenizer = AutoTokenizer.from_pretrained(
-            self.config.base_model, do_lower_case=self.config.do_lower_case)
+        self.tokenizer = AutoTokenizer.from_pretrained(self.config.base_model, do_lower_case=self.config.do_lower_case)
 
     def get_data(self, phase):
         """
@@ -295,8 +293,7 @@ class FinBert(object):
             train = pd.read_csv(train_path, sep=delimiter, index_col=False)
 
             if 'label' not in train.columns:
-                raise ValueError(
-                    f"Column 'label' not found in train.csv. Available columns: {train.columns.tolist()}")
+                raise ValueError(f"Column 'label' not found in train.csv. Available columns: {train.columns.tolist()}")
 
             # Calculate class weights
             class_weights = []
@@ -393,14 +390,12 @@ class FinBert(object):
             optimizer_grouped_parameters = [
                 {'params': [p for n, p in param_optimizer if not any(nd in n for nd in no_decay)],
                  'weight_decay': 0.01},
-                {'params': [p for n, p in param_optimizer if any(
-                    nd in n for nd in no_decay)], 'weight_decay': 0.0}
+                {'params': [p for n, p in param_optimizer if any(nd in n for nd in no_decay)], 'weight_decay': 0.0}
             ]
 
         schedule = "warmup_linear"
 
-        self.num_warmup_steps = int(
-            float(self.num_train_optimization_steps) * self.config.warm_up_proportion)
+        self.num_warmup_steps = int(float(self.num_train_optimization_steps) * self.config.warm_up_proportion)
 
         self.optimizer = AdamW(optimizer_grouped_parameters,
                                lr=self.config.learning_rate)
@@ -438,29 +433,21 @@ class FinBert(object):
         logger.info("  Num steps = %d", self.num_train_optimization_steps)
 
         # Load the data, make it into TensorDataset
-        all_input_ids = torch.tensor(
-            [f.input_ids for f in features], dtype=torch.long)
-        all_attention_mask = torch.tensor(
-            [f.attention_mask for f in features], dtype=torch.long)
-        all_token_type_ids = torch.tensor(
-            [f.token_type_ids for f in features], dtype=torch.long)
+        all_input_ids = torch.tensor([f.input_ids for f in features], dtype=torch.long)
+        all_attention_mask = torch.tensor([f.attention_mask for f in features], dtype=torch.long)
+        all_token_type_ids = torch.tensor([f.token_type_ids for f in features], dtype=torch.long)
 
         if self.config.output_mode == "classification":
-            all_label_ids = torch.tensor(
-                [f.label_id for f in features], dtype=torch.long)
+            all_label_ids = torch.tensor([f.label_id for f in features], dtype=torch.long)
         elif self.config.output_mode == "regression":
-            all_label_ids = torch.tensor(
-                [f.label_id for f in features], dtype=torch.float)
+            all_label_ids = torch.tensor([f.label_id for f in features], dtype=torch.float)
 
         try:
-            all_agree_ids = torch.tensor(
-                [f.agree for f in features], dtype=torch.long)
+            all_agree_ids = torch.tensor([f.agree for f in features], dtype=torch.long)
         except:
-            all_agree_ids = torch.tensor(
-                [0.0 for f in features], dtype=torch.long)
+            all_agree_ids = torch.tensor([0.0 for f in features], dtype=torch.long)
 
-        data = TensorDataset(all_input_ids, all_attention_mask,
-                             all_token_type_ids, all_label_ids, all_agree_ids)
+        data = TensorDataset(all_input_ids, all_attention_mask, all_token_type_ids, all_label_ids, all_agree_ids)
 
         # Distributed, if necessary
         if phase == 'train':
@@ -468,8 +455,7 @@ class FinBert(object):
         elif phase == 'eval':
             my_sampler = SequentialSampler(data)
 
-        dataloader = DataLoader(data, sampler=my_sampler,
-                                batch_size=self.config.train_batch_size)
+        dataloader = DataLoader(data, sampler=my_sampler, batch_size=self.config.train_batch_size)
         return dataloader
 
     def train(self, train_examples, model):
@@ -742,7 +728,7 @@ def predict(text, model, write_to_csv=False, path=None, use_gpu=False, gpu_name=
     write_to_csv (optional): bool
     path (optional): string
         path to write the string
-    use_gpu: (optional): bool 
+    use_gpu: (optional): bool
         enables inference on GPU
     gpu_name: (optional): string
         multi-gpu support: allows specifying which gpu to use

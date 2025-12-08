@@ -71,7 +71,7 @@ class DataProcessor(object):
             first_line = f.readline()
             delimiter = "\t" if first_line.count('\t') > first_line.count(',') else ","
             f.seek(0)
-            
+
             reader = csv.reader(f, delimiter=delimiter, quotechar='"')
             lines = []
             for line in reader:
@@ -111,7 +111,7 @@ class FinSentProcessor(DataProcessor):
     def _create_examples(self, lines, set_type):
         """Creates examples for the training and dev sets."""
         examples = []
-        
+
         # Detect format from header
         format_type = None
         if lines:
@@ -121,14 +121,14 @@ class FinSentProcessor(DataProcessor):
                     format_type = 'id_text'
                 elif any('text' in col or 'sentence' in col for col in header):
                     format_type = 'text_label'
-        
+
         for (i, line) in enumerate(lines[1:], start=1):  # Skip header
             if not line:
                 logger.warning(f"Skipping line {i+1}: empty line")
                 continue
-            
+
             guid = "%s-%s" % (set_type, str(i))
-            
+
             # Parse columns based on format
             if format_type == 'id_text':
                 if len(line) < 2:
@@ -149,15 +149,15 @@ class FinSentProcessor(DataProcessor):
                 text = line[1].strip()
                 label = line[2].strip() if len(line) > 2 else None
                 agree = line[3] if len(line) > 3 else None
-            
+
             if not text:
                 logger.warning(f"Skipping line {i+1}: empty text")
                 continue
-            
+
             if label is not None and not label:
                 logger.warning(f"Skipping line {i+1}: empty label")
                 continue
-            
+
             examples.append(InputExample(guid=guid, text=text, label=label, agree=agree))
         return examples
 
@@ -165,18 +165,18 @@ class FinSentProcessor(DataProcessor):
 def normalize_label(label, label_list):
     """
     Normalize and match a label to the label_list (case-insensitive).
-    
+
     Returns:
         str: Matching label from label_list, or None if no match
     """
     if label is None:
         return None
-    
+
     # Clean label: remove whitespace, tabs, newlines
     cleaned = ' '.join(label.strip().replace('\t', ' ').replace('\n', ' ').replace('\r', ' ').split())
     if not cleaned:
         return None
-    
+
     # Case-insensitive matching
     normalized = cleaned.lower()
     matching = next((label for label in label_list if label.lower() == normalized), None)
