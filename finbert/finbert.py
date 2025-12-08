@@ -3,22 +3,97 @@ from __future__ import absolute_import, division, print_function
 import random
 
 import pandas as pd
+import torch
 from torch.nn import MSELoss, CrossEntropyLoss
 from torch.utils.data import (DataLoader, RandomSampler, SequentialSampler,
     TensorDataset)
 from tqdm import tqdm_notebook as tqdm
 from tqdm import trange
 from nltk.tokenize import sent_tokenize
+import nltk
+
+# Download punkt_tab if not already downloaded
+try:
+    nltk.data.find('tokenizers/punkt_tab')
+except LookupError:
+    nltk.download('punkt_tab', quiet=True)
 from finbert.utils import *
 import numpy as np
 import logging
 
-from transformers.optimization import AdamW, get_linear_schedule_with_warmup
+from torch.optim import AdamW
+from transformers.optimization import get_linear_schedule_with_warmup
 from transformers import AutoTokenizer
 
 logger = logging.getLogger(__name__)
 
 tokenizer = AutoTokenizer.from_pretrained('bert-base-uncased')
+
+
+def get_device(no_cuda=False):
+    """
+    Get the best available device for PyTorch operations.
+    Priority: CUDA > MPS > CPU
+
+    Parameters
+    ----------
+    no_cuda: bool
+        If True, skip CUDA even if available (default: False)
+
+    Returns
+    -------
+    torch.device
+        The best available device
+    """
+    if not no_cuda and torch.cuda.is_available():
+        return torch.device("cuda")
+    elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available() and torch.backends.mps.is_built():
+        return torch.device("mps")
+    else:
+        return torch.device("cpu")
+
+
+def check_tensor_valid(tensor, name="tensor"):
+    """Check if tensor contains NaN or Inf values."""
+    if torch.isnan(tensor).any() or torch.isinf(tensor).any():
+        nan_count = torch.isnan(tensor).sum().item()
+        inf_count = torch.isinf(tensor).sum().item()
+        logger.warning(
+            f"Invalid values in {name}: NaN={nan_count}, Inf={inf_count}")
+        return False
+    return True
+
+
+def safe_loss_calculation(logits, label_ids, weights, num_labels, output_mode, ignore_index=9090):
+    """
+    Calculate loss with basic error checking.
+
+    Returns:
+        tuple: (loss tensor or None, skip_batch bool)
+    """
+    # Basic validity check for logits
+    if torch.isnan(logits).any() or torch.isinf(logits).any():
+        logger.warning("Invalid logits detected (NaN/Inf). Skipping batch.")
+        return None, True
+
+    # Calculate loss
+    if output_mode == "classification":
+        loss_fct = CrossEntropyLoss(weight=weights, ignore_index=ignore_index)
+        loss = loss_fct(logits.view(-1, num_labels), label_ids.view(-1))
+    elif output_mode == "regression":
+        loss_fct = MSELoss()
+        loss = loss_fct(logits.view(-1), label_ids.view(-1))
+    else:
+        raise ValueError(f"Unknown output_mode: {output_mode}")
+
+    # Check if loss is valid (PyTorch will handle ignore_index internally)
+    if torch.isnan(loss) or torch.isinf(loss):
+        logger.warning(
+            f"Invalid loss detected: {loss.item()}. Skipping batch.")
+        return None, True
+
+    return loss, False
+
 
 class Config(object):
     """The configuration class for training."""
@@ -139,8 +214,14 @@ class FinBert(object):
         }
 
         if self.config.local_rank == -1 or self.config.no_cuda:
-            self.device = torch.device("cuda" if torch.cuda.is_available() and not self.config.no_cuda else "cpu")
-            self.n_gpu = torch.cuda.device_count()
+            self.device = get_device(self.config.no_cuda)
+            # For CUDA, count devices; for MPS, there's only one device; for CPU, zero
+            if self.device.type == "cuda":
+                self.n_gpu = torch.cuda.device_count()
+            elif self.device.type == "mps":
+                self.n_gpu = 1
+            else:
+                self.n_gpu = 0
         else:
             torch.cuda.set_device(self.config.local_rank)
             self.device = torch.device("cuda", self.config.local_rank)
@@ -160,7 +241,7 @@ class FinBert(object):
         np.random.seed(self.config.seed)
         torch.manual_seed(self.config.seed)
 
-        if self.n_gpu > 0:
+        if self.device.type == "cuda" and self.n_gpu > 0:
             torch.cuda.manual_seed_all(self.config.seed)
 
         if os.path.exists(self.config.model_dir) and os.listdir(self.config.model_dir):
@@ -172,7 +253,7 @@ class FinBert(object):
         self.num_labels = len(label_list)
         self.label_list = label_list
 
-        self.tokenizer = AutoTokenizer.from_pretrained(self.base_model, do_lower_case=self.config.do_lower_case)
+        self.tokenizer = AutoTokenizer.from_pretrained(self.config.base_model, do_lower_case=self.config.do_lower_case)
 
     def get_data(self, phase):
         """
@@ -189,6 +270,12 @@ class FinBert(object):
             A list of InputExample's. Each InputExample is an object that includes the information for each example;
             text, id, label...
         """
+        # Check if prepare_model has been called
+        if not hasattr(self, 'processor') or self.processor is None:
+            raise AttributeError(
+                "The 'processor' attribute is not initialized. "
+                "Please call 'finbert.prepare_model(label_list)' first before calling 'get_data()'."
+            )
 
         self.num_train_optimization_steps = None
         examples = None
@@ -198,12 +285,42 @@ class FinBert(object):
                 examples) / self.config.train_batch_size / self.config.gradient_accumulation_steps) * self.config.num_train_epochs
 
         if phase == 'train':
-            train = pd.read_csv(os.path.join(self.config.data_dir, 'train.csv'), sep='\t', index_col=False)
-            weights = list()
-            labels = self.label_list
+            # Detect CSV vs TSV format
+            train_path = os.path.join(self.config.data_dir, 'train.csv')
+            with open(train_path, 'r', encoding='utf-8') as f:
+                delimiter = ',' if ',' in f.readline() else '\t'
 
-            class_weights = [train.shape[0] / train[train.label == label].shape[0] for label in labels]
-            self.class_weights = torch.tensor(class_weights)
+            train = pd.read_csv(train_path, sep=delimiter, index_col=False)
+
+            if 'label' not in train.columns:
+                raise ValueError(f"Column 'label' not found in train.csv. Available columns: {train.columns.tolist()}")
+
+            # Calculate class weights
+            class_weights = []
+            for label in self.label_list:
+                label_count = train[train['label'] == label].shape[0]
+                if label_count == 0:
+                    logger.warning(
+                        f"Label '{label}' not found in training data. Using weight 1.0")
+                    class_weights.append(1.0)
+                else:
+                    weight = train.shape[0] / label_count
+                    if np.isnan(weight) or np.isinf(weight):
+                        logger.warning(
+                            f"Invalid weight for label '{label}'. Using weight 1.0")
+                        class_weights.append(1.0)
+                    else:
+                        class_weights.append(weight)
+
+            self.class_weights = torch.tensor(
+                class_weights, dtype=torch.float32)
+            if not check_tensor_valid(self.class_weights, "class_weights"):
+                logger.error(
+                    "Invalid class weights detected. Using uniform weights.")
+                self.class_weights = torch.ones(
+                    len(self.label_list), dtype=torch.float32)
+
+            logger.info(f"Class weights: {self.class_weights}")
 
         return examples
 
@@ -267,7 +384,6 @@ class FinBert(object):
 
             optimizer_grouped_parameters.extend(encoder_params)
 
-
         else:
             param_optimizer = list(model.named_parameters())
 
@@ -279,16 +395,14 @@ class FinBert(object):
 
         schedule = "warmup_linear"
 
-
         self.num_warmup_steps = int(float(self.num_train_optimization_steps) * self.config.warm_up_proportion)
 
         self.optimizer = AdamW(optimizer_grouped_parameters,
-                          lr=self.config.learning_rate,
-                          correct_bias=False)
+                               lr=self.config.learning_rate)
 
         self.scheduler = get_linear_schedule_with_warmup(self.optimizer,
-                                                    num_warmup_steps=self.num_warmup_steps,
-                                                    num_training_steps=self.num_train_optimization_steps)
+                                                         num_warmup_steps=self.num_warmup_steps,
+                                                         num_training_steps=self.num_train_optimization_steps)
 
         return model
 
@@ -364,11 +478,19 @@ class FinBert(object):
         validation_examples = self.get_data('validation')
 
         global_step = 0
+        best_model = 0
 
         self.validation_losses = []
+        self.training_losses = []
 
         # Training
         train_dataloader = self.get_loader(train_examples, 'train')
+
+        # Check model parameters for NaN/Inf before training
+        for name, param in model.named_parameters():
+            if param.requires_grad and not check_tensor_valid(param, f"parameter '{name}'"):
+                logger.error(
+                    "Model contains invalid parameters. Check pretrained weights.")
 
         model.train()
 
@@ -406,18 +528,22 @@ class FinBert(object):
                         param.requires_grad = True
 
                 batch = tuple(t.to(self.device) for t in batch)
-
                 input_ids, attention_mask, token_type_ids, label_ids, agree_ids = batch
 
                 logits = model(input_ids, attention_mask, token_type_ids)[0]
-                weights = self.class_weights.to(self.device)
+                weights = self.class_weights.to(
+                    self.device) if self.config.output_mode == "classification" else None
 
-                if self.config.output_mode == "classification":
-                    loss_fct = CrossEntropyLoss(weight=weights)
-                    loss = loss_fct(logits.view(-1, self.num_labels), label_ids.view(-1))
-                elif self.config.output_mode == "regression":
-                    loss_fct = MSELoss()
-                    loss = loss_fct(logits.view(-1), label_ids.view(-1))
+                # Calculate loss with error checking
+                loss, skip_batch = safe_loss_calculation(
+                    logits, label_ids, weights, self.num_labels,
+                    self.config.output_mode, ignore_index=9090
+                )
+
+                if skip_batch:
+                    if (step + 1) % self.config.gradient_accumulation_steps == 0:
+                        self.optimizer.zero_grad()
+                    continue
 
                 if self.config.gradient_accumulation_steps > 1:
                     loss = loss / self.config.gradient_accumulation_steps
@@ -439,33 +565,37 @@ class FinBert(object):
                     self.optimizer.zero_grad()
                     global_step += 1
 
-            # Validation
+            # Calculate average training loss for this epoch
+            avg_tr_loss = tr_loss / nb_tr_steps if nb_tr_steps > 0 else 0
+            self.training_losses.append(avg_tr_loss)
 
-            validation_loader = self.get_loader(validation_examples, phase='eval')
+            # Validation
+            validation_loader = self.get_loader(
+                validation_examples, phase='eval')
             model.eval()
 
-            valid_loss, valid_accuracy = 0, 0
-            nb_valid_steps, nb_valid_examples = 0, 0
+            valid_loss = 0
+            nb_valid_steps = 0
+            weights = self.class_weights.to(
+                self.device) if self.config.output_mode == "classification" else None
 
             for input_ids, attention_mask, token_type_ids, label_ids, agree_ids in tqdm(validation_loader, desc="Validating"):
-                input_ids = input_ids.to(self.device)
-                attention_mask = attention_mask.to(self.device)
-                token_type_ids = token_type_ids.to(self.device)
-                label_ids = label_ids.to(self.device)
-                agree_ids = agree_ids.to(self.device)
+                batch = tuple(t.to(self.device) for t in (
+                    input_ids, attention_mask, token_type_ids, label_ids, agree_ids))
+                input_ids, attention_mask, token_type_ids, label_ids, agree_ids = batch
 
                 with torch.no_grad():
-                    logits = model(input_ids, attention_mask, token_type_ids)[0]
+                    logits = model(input_ids, attention_mask,
+                                   token_type_ids)[0]
+                    tmp_valid_loss, skip_batch = safe_loss_calculation(
+                        logits, label_ids, weights, self.num_labels,
+                        self.config.output_mode, ignore_index=9090
+                    )
 
-                    if self.config.output_mode == "classification":
-                        loss_fct = CrossEntropyLoss(weight=weights)
-                        tmp_valid_loss = loss_fct(logits.view(-1, self.num_labels), label_ids.view(-1))
-                    elif self.config.output_mode == "regression":
-                        loss_fct = MSELoss()
-                        tmp_valid_loss = loss_fct(logits.view(-1), label_ids.view(-1))
+                    if skip_batch:
+                        continue
 
-                    valid_loss += tmp_valid_loss.mean().item()
-
+                    valid_loss += tmp_valid_loss.item()
                     nb_valid_steps += 1
 
             valid_loss = valid_loss / nb_valid_steps
@@ -476,7 +606,8 @@ class FinBert(object):
             if valid_loss == min(self.validation_losses):
 
                 try:
-                    os.remove(self.config.model_dir / ('temporary' + str(best_model)))
+                    os.remove(self.config.model_dir /
+                              ('temporary' + str(best_model)))
                 except:
                     print('No best model found')
                 torch.save({'epoch': str(i), 'state_dict': model.state_dict()},
@@ -484,9 +615,11 @@ class FinBert(object):
                 best_model = i
 
         # Save a trained model and the associated configuration
-        checkpoint = torch.load(self.config.model_dir / ('temporary' + str(best_model)))
+        checkpoint = torch.load(
+            self.config.model_dir / ('temporary' + str(best_model)))
         model.load_state_dict(checkpoint['state_dict'])
-        model_to_save = model.module if hasattr(model, 'module') else model  # Only save the model it-self
+        model_to_save = model.module if hasattr(
+            model, 'module') else model  # Only save the model it-self
         output_model_file = os.path.join(self.config.model_dir, WEIGHTS_NAME)
         torch.save(model_to_save.state_dict(), output_model_file)
         output_config_file = os.path.join(self.config.model_dir, CONFIG_NAME)
@@ -536,11 +669,14 @@ class FinBert(object):
                 logits = model(input_ids, attention_mask, token_type_ids)[0]
 
                 if self.config.output_mode == "classification":
-                    loss_fct = CrossEntropyLoss()
-                    tmp_eval_loss = loss_fct(logits.view(-1, self.num_labels), label_ids.view(-1))
+                    # Use ignore_index=9090 to ignore None labels (placeholder for missing labels)
+                    loss_fct = CrossEntropyLoss(ignore_index=9090)
+                    tmp_eval_loss = loss_fct(
+                        logits.view(-1, self.num_labels), label_ids.view(-1))
                 elif self.config.output_mode == "regression":
                     loss_fct = MSELoss()
-                    tmp_eval_loss = loss_fct(logits.view(-1), label_ids.view(-1))
+                    tmp_eval_loss = loss_fct(
+                        logits.view(-1), label_ids.view(-1))
 
                 np_logits = logits.cpu().numpy()
 
@@ -573,7 +709,8 @@ class FinBert(object):
             # eval_loss += tmp_eval_loss.mean().item()
             # eval_accuracy += tmp_eval_accuracy
 
-        evaluation_df = pd.DataFrame({'predictions': predictions, 'labels': labels, "agree_levels": agree_levels})
+        evaluation_df = pd.DataFrame(
+            {'predictions': predictions, 'labels': labels, "agree_levels": agree_levels})
 
         return evaluation_df
 
@@ -591,7 +728,7 @@ def predict(text, model, write_to_csv=False, path=None, use_gpu=False, gpu_name=
     write_to_csv (optional): bool
     path (optional): string
         path to write the string
-    use_gpu: (optional): bool 
+    use_gpu: (optional): bool
         enables inference on GPU
     gpu_name: (optional): string
         multi-gpu support: allows specifying which gpu to use
@@ -600,26 +737,49 @@ def predict(text, model, write_to_csv=False, path=None, use_gpu=False, gpu_name=
     """
     model.eval()
 
+    # Ensure punkt_tab is available
+    try:
+        nltk.data.find('tokenizers/punkt_tab')
+    except LookupError:
+        logger.info("Downloading NLTK punkt_tab tokenizer...")
+        nltk.download('punkt_tab', quiet=True)
+
     sentences = sent_tokenize(text)
 
-    device = gpu_name if use_gpu and torch.cuda.is_available() else "cpu"
+    if use_gpu:
+        # Use the helper function to get the best available device
+        device_obj = get_device(no_cuda=False)
+        # If user specified a specific GPU name and we're using CUDA, use that
+        if device_obj.type == "cuda" and gpu_name.startswith("cuda"):
+            device = gpu_name
+        else:
+            device = str(device_obj)
+    else:
+        device = "cpu"
     logging.info("Using device: %s " % device)
     label_list = ['positive', 'negative', 'neutral']
     label_dict = {0: 'positive', 1: 'negative', 2: 'neutral'}
-    result = pd.DataFrame(columns=['sentence', 'logit', 'prediction', 'sentiment_score'])
+    result = pd.DataFrame(
+        columns=['sentence', 'logit', 'prediction', 'sentiment_score'])
     for batch in chunks(sentences, batch_size):
-        examples = [InputExample(str(i), sentence) for i, sentence in enumerate(batch)]
+        examples = [InputExample(str(i), sentence)
+                    for i, sentence in enumerate(batch)]
 
-        features = convert_examples_to_features(examples, label_list, 64, tokenizer)
+        features = convert_examples_to_features(
+            examples, label_list, 64, tokenizer)
 
-        all_input_ids = torch.tensor([f.input_ids for f in features], dtype=torch.long).to(device)
-        all_attention_mask = torch.tensor([f.attention_mask for f in features], dtype=torch.long).to(device)
-        all_token_type_ids = torch.tensor([f.token_type_ids for f in features], dtype=torch.long).to(device)
+        all_input_ids = torch.tensor(
+            [f.input_ids for f in features], dtype=torch.long).to(device)
+        all_attention_mask = torch.tensor(
+            [f.attention_mask for f in features], dtype=torch.long).to(device)
+        all_token_type_ids = torch.tensor(
+            [f.token_type_ids for f in features], dtype=torch.long).to(device)
 
         with torch.no_grad():
-            model     = model.to(device)
+            model = model.to(device)
 
-            logits = model(all_input_ids, all_attention_mask, all_token_type_ids)[0]
+            logits = model(all_input_ids, all_attention_mask,
+                           all_token_type_ids)[0]
             logging.info(logits)
             logits = softmax(np.array(logits.cpu()))
             sentiment_score = pd.Series(logits[:, 0] - logits[:, 1])

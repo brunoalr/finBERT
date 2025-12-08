@@ -65,13 +65,24 @@ class DataProcessor(object):
 
     @classmethod
     def _read_tsv(cls, input_file):
-        """Reads a tab separated value file."""
-        with open(input_file, "r") as f:
-            reader = csv.reader(f, delimiter="\t")
+        """Reads a tab separated value file or CSV file."""
+        # Auto-detect delimiter
+        with open(input_file, "r", encoding='utf-8') as f:
+            first_line = f.readline()
+            delimiter = "\t" if first_line.count('\t') > first_line.count(',') else ","
+            f.seek(0)
+
+            reader = csv.reader(f, delimiter=delimiter, quotechar='"')
             lines = []
             for line in reader:
                 if sys.version_info[0] == 2:
-                    line = list(unicode(cell, 'utf-8') for cell in line)
+                    try:
+                        unicode_type = unicode  # noqa: F821
+                    except NameError:
+                        unicode_type = str
+                    line = [unicode_type(cell, 'utf-8') for cell in line]
+                else:
+                    line = [str(cell) for cell in line]
                 lines.append(line)
         return lines
 
@@ -100,19 +111,76 @@ class FinSentProcessor(DataProcessor):
     def _create_examples(self, lines, set_type):
         """Creates examples for the training and dev sets."""
         examples = []
-        for (i, line) in enumerate(lines):
-            if i == 0:
+
+        # Detect format from header
+        format_type = None
+        if lines:
+            header = [str(col).lower() for col in lines[0]]
+            if len(header) == 2:
+                if header[0] in ['id', 'index'] and header[1] == 'text':
+                    format_type = 'id_text'
+                elif any('text' in col or 'sentence' in col for col in header):
+                    format_type = 'text_label'
+
+        for (i, line) in enumerate(lines[1:], start=1):  # Skip header
+            if not line:
+                logger.warning(f"Skipping line {i+1}: empty line")
                 continue
+
             guid = "%s-%s" % (set_type, str(i))
-            text = line[1]
-            label = line[2]
-            try:
-                agree = line[3]
-            except:
-                agree = None
-            examples.append(
-                InputExample(guid=guid, text=text, label=label, agree=agree))
+
+            # Parse columns based on format
+            if format_type == 'id_text':
+                if len(line) < 2:
+                    logger.warning(f"Skipping line {i+1}: insufficient columns")
+                    continue
+                text, label, agree = line[1].strip(), None, None
+            elif len(line) == 2:
+                # Auto-detect: if first col looks like ID, treat as id_text
+                col0, col1 = line[0].strip(), line[1].strip()
+                if (col0.isdigit() or len(col0) < 10) and len(col1) > len(col0):
+                    text, label, agree = col1, None, None
+                else:
+                    text, label, agree = col0, col1, None
+            else:  # 3+ columns: standard format
+                if len(line) < 3:
+                    logger.warning(f"Skipping line {i+1}: insufficient columns")
+                    continue
+                text = line[1].strip()
+                label = line[2].strip() if len(line) > 2 else None
+                agree = line[3] if len(line) > 3 else None
+
+            if not text:
+                logger.warning(f"Skipping line {i+1}: empty text")
+                continue
+
+            if label is not None and not label:
+                logger.warning(f"Skipping line {i+1}: empty label")
+                continue
+
+            examples.append(InputExample(guid=guid, text=text, label=label, agree=agree))
         return examples
+
+
+def normalize_label(label, label_list):
+    """
+    Normalize and match a label to the label_list (case-insensitive).
+
+    Returns:
+        str: Matching label from label_list, or None if no match
+    """
+    if label is None:
+        return None
+
+    # Clean label: remove whitespace, tabs, newlines
+    cleaned = ' '.join(label.strip().replace('\t', ' ').replace('\n', ' ').replace('\r', ' ').split())
+    if not cleaned:
+        return None
+
+    # Case-insensitive matching
+    normalized = cleaned.lower()
+    matching = next((label for label in label_list if label.lower() == normalized), None)
+    return matching
 
 
 def convert_examples_to_features(examples, label_list, max_seq_length, tokenizer, mode='classification'):
@@ -142,6 +210,9 @@ def convert_examples_to_features(examples, label_list, max_seq_length, tokenizer
     if mode == 'classification':
         label_map = {label: i for i, label in enumerate(label_list)}
         label_map[None] = 9090
+        if not hasattr(convert_examples_to_features, '_logged_label_map'):
+            logger.info(f"Label map: {label_map}")
+            convert_examples_to_features._logged_label_map = True
 
     features = []
     for (ex_index, example) in enumerate(examples):
@@ -152,18 +223,13 @@ def convert_examples_to_features(examples, label_list, max_seq_length, tokenizer
                                                           len(tokens) - (3 * max_seq_length // 4) + 1:]
 
         tokens = ["[CLS]"] + tokens + ["[SEP]"]
-
         token_type_ids = [0] * len(tokens)
-
         input_ids = tokenizer.convert_tokens_to_ids(tokens)
-
         attention_mask = [1] * len(input_ids)
 
         padding = [0] * (max_seq_length - len(input_ids))
         input_ids += padding
         attention_mask += padding
-
-
         token_type_ids += padding
 
         assert len(input_ids) == max_seq_length
@@ -171,11 +237,17 @@ def convert_examples_to_features(examples, label_list, max_seq_length, tokenizer
         assert len(token_type_ids) == max_seq_length
 
         if mode == 'classification':
-            label_id = label_map[example.label]
+            matched_label = normalize_label(example.label, label_list)
+            if matched_label is None:
+                if example.label is not None and ex_index < 5:
+                    logger.warning(f"Label '{example.label}' not found in {label_list}, treating as None")
+                label_id = label_map[None]
+            else:
+                label_id = label_map[matched_label]
         elif mode == 'regression':
-            label_id = float(example.label)
+            label_id = float(example.label) if example.label is not None else 0.0
         else:
-            raise ValueError("The mode should either be classification or regression. You entered: " + mode)
+            raise ValueError(f"Mode must be 'classification' or 'regression', got: {mode}")
 
         agree = example.agree
         mapagree = {'0.5': 1, '0.66': 2, '0.75': 3, '1.0': 4}
