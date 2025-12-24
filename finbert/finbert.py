@@ -312,7 +312,15 @@ class FinBert(object):
 
         self.num_train_optimization_steps = None
         examples = None
-        examples = self.processor.get_examples(self.config.data_dir, phase)
+        
+        # Check if we have stored splits from training (when dataset was split)
+        if phase == 'validation' and hasattr(self, 'validation_examples'):
+            examples = self.validation_examples
+        elif phase == 'test' and hasattr(self, 'test_examples'):
+            examples = self.test_examples
+        else:
+            # Try to load from dataset or file system
+            examples = self.processor.get_examples(self.config.data_dir, phase)
         
         # Remove URLs from text samples
         for example in examples:
@@ -644,17 +652,26 @@ class FinBert(object):
                     # They are the same - split training data
                     if self.processor._is_hf_dataset_id(self.config.data_dir):
                         logger.warning(
-                            "Validation split not found. Splitting training data into train/validation (80/20 split)."
+                            "Validation split not found. Splitting training data into train/validation/test (80/10/10 split)."
                         )
                         from sklearn.model_selection import train_test_split
-                        # Split training examples into train and validation
-                        actual_train_examples, validation_examples = train_test_split(
+                        # Split training examples into train (80%) and temp (20%)
+                        actual_train_examples, temp_examples = train_test_split(
                             train_examples, 
                             test_size=0.2, 
                             random_state=self.config.seed
                         )
+                        # Split temp into validation (10%) and test (10%)
+                        validation_examples, test_examples = train_test_split(
+                            temp_examples,
+                            test_size=0.5,
+                            random_state=self.config.seed
+                        )
                         train_examples = actual_train_examples
-                        logger.info(f"Split training data: {len(train_examples)} train, {len(validation_examples)} validation")
+                        # Store validation_examples and test_examples as instance variables for later use
+                        self.validation_examples = validation_examples
+                        self.test_examples = test_examples
+                        logger.info(f"Split training data: {len(train_examples)} train, {len(validation_examples)} validation, {len(test_examples)} test")
                         # Recalculate num_train_optimization_steps based on the new training data size
                         self.num_train_optimization_steps = int(
                             len(train_examples) / self.config.train_batch_size / self.config.gradient_accumulation_steps
@@ -668,17 +685,26 @@ class FinBert(object):
             )
             if is_validation_error and self.processor._is_hf_dataset_id(self.config.data_dir):
                 logger.warning(
-                    "Validation split not found. Splitting training data into train/validation (80/20 split)."
+                    "Validation split not found. Splitting training data into train/validation/test (80/10/10 split)."
                 )
                 from sklearn.model_selection import train_test_split
-                # Split training examples into train and validation
-                actual_train_examples, validation_examples = train_test_split(
+                # Split training examples into train (80%) and temp (20%)
+                actual_train_examples, temp_examples = train_test_split(
                     train_examples, 
                     test_size=0.2, 
                     random_state=self.config.seed
                 )
+                # Split temp into validation (10%) and test (10%)
+                validation_examples, test_examples = train_test_split(
+                    temp_examples,
+                    test_size=0.5,
+                    random_state=self.config.seed
+                )
                 train_examples = actual_train_examples
-                logger.info(f"Split training data: {len(train_examples)} train, {len(validation_examples)} validation")
+                # Store validation_examples and test_examples as instance variables for later use
+                self.validation_examples = validation_examples
+                self.test_examples = test_examples
+                logger.info(f"Split training data: {len(train_examples)} train, {len(validation_examples)} validation, {len(test_examples)} test")
                 # Recalculate num_train_optimization_steps based on the new training data size
                 self.num_train_optimization_steps = int(
                     len(train_examples) / self.config.train_batch_size / self.config.gradient_accumulation_steps
