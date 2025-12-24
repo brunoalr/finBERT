@@ -1,6 +1,7 @@
 from __future__ import absolute_import, division, print_function
 
 import random
+import re
 
 import pandas as pd
 import torch
@@ -28,6 +29,38 @@ from transformers import AutoTokenizer
 logger = logging.getLogger(__name__)
 
 tokenizer = AutoTokenizer.from_pretrained('bert-base-uncased')
+
+
+def remove_urls(text):
+    """
+    Remove URLs from text.
+    
+    Parameters
+    ----------
+    text: str
+        Text that may contain URLs.
+        
+    Returns
+    -------
+    str
+        Text with URLs removed.
+    """
+    if not text or not isinstance(text, str):
+        return text
+    
+    # Pattern to match URLs (http, https, www, and domain patterns)
+    url_pattern = re.compile(
+        r'http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\\(\\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+|'
+        r'www\.(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\\(\\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+|'
+        r'[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*\.[a-zA-Z]{2,}(?:/[^\s]*)?'
+    )
+    
+    # Remove URLs and clean up extra whitespace
+    text_without_urls = url_pattern.sub('', text)
+    # Clean up multiple spaces that might result from URL removal
+    text_without_urls = re.sub(r'\s+', ' ', text_without_urls).strip()
+    
+    return text_without_urls
 
 
 def get_device(no_cuda=False):
@@ -280,30 +313,128 @@ class FinBert(object):
         self.num_train_optimization_steps = None
         examples = None
         examples = self.processor.get_examples(self.config.data_dir, phase)
+        
+        # Remove URLs from text samples
+        for example in examples:
+            if hasattr(example, 'text') and example.text:
+                example.text = remove_urls(example.text)
+        
         self.num_train_optimization_steps = int(
             len(
                 examples) / self.config.train_batch_size / self.config.gradient_accumulation_steps) * self.config.num_train_epochs
 
         if phase == 'train':
-            # Detect CSV vs TSV format
-            train_path = os.path.join(self.config.data_dir, 'train.csv')
-            with open(train_path, 'r', encoding='utf-8') as f:
-                delimiter = ',' if ',' in f.readline() else '\t'
+            # Check if using Hugging Face dataset
+            if self.processor._is_hf_dataset_id(self.config.data_dir):
+                # Load HF dataset for class weight calculation
+                try:
+                    from datasets import load_dataset
+                    
+                    # Map phase to HF split name
+                    split_mapping = {
+                        'train': 'train',
+                        'validation': 'validation',
+                        'val': 'validation',
+                        'test': 'test',
+                        'eval': 'test'
+                    }
+                    hf_split = split_mapping.get('train', 'train')
+                    
+                    # Load the dataset
+                    try:
+                        dataset = load_dataset(self.config.data_dir, split=hf_split)
+                    except ValueError:
+                        full_dataset = load_dataset(self.config.data_dir)
+                        if hf_split in full_dataset:
+                            dataset = full_dataset[hf_split]
+                        else:
+                            dataset = full_dataset[list(full_dataset.keys())[0]]
+                    
+                    # Get column names and find label column
+                    column_names = dataset.column_names
+                    label_candidates = ['label', 'sentiment', 'target', 'class', 'sentiment_label']
+                    label_col = None
+                    for col in column_names:
+                        if col.lower() in label_candidates:
+                            label_col = col
+                            break
+                    
+                    if label_col is None:
+                        if len(column_names) > 1:
+                            label_col = column_names[-1] if column_names[-1] != column_names[0] else column_names[1]
+                        else:
+                            raise ValueError(f"Could not find label column in dataset. Available columns: {column_names}")
+                    
+                    # Convert to DataFrame for weight calculation
+                    train_data = []
+                    unique_labels = set()
+                    label_mapping_stats = {}
+                    
+                    for example in dataset:
+                        label = str(example[label_col]) if label_col in example else None
+                        if label is not None:
+                            unique_labels.add(label)
+                            # Normalize label using the existing function
+                            normalized_label = normalize_label(label, self.label_list)
+                            
+                            # Track mapping statistics
+                            if label not in label_mapping_stats:
+                                label_mapping_stats[label] = {'count': 0, 'normalized_to': normalized_label}
+                            label_mapping_stats[label]['count'] += 1
+                            
+                            # Store normalized label (or original if normalization failed)
+                            train_data.append({'label': normalized_label if normalized_label else label})
+                    
+                    # Log unique labels found in dataset for debugging
+                    logger.info(f"Unique labels found in dataset: {sorted(unique_labels)}")
+                    logger.info(f"Expected labels: {self.label_list}")
+                    logger.info(f"Label mapping: {label_mapping_stats}")
+                    
+                    train = pd.DataFrame(train_data)
+                    
+                    if train.empty:
+                        raise ValueError("No training data found in Hugging Face dataset")
+                    
+                    # Log normalized label distribution
+                    normalized_labels = train['label'].apply(lambda x: normalize_label(str(x) if x is not None else None, self.label_list))
+                    logger.info(f"Normalized label distribution: {normalized_labels.value_counts().to_dict()}")
+                    
+                    # Update train DataFrame to use normalized labels
+                    train['label'] = normalized_labels
+                    
+                except Exception as e:
+                    logger.error(f"Failed to load Hugging Face dataset for class weights: {str(e)}")
+                    raise ValueError(f"Error loading Hugging Face dataset: {str(e)}")
+            else:
+                # Load CSV file (existing logic)
+                train_path = os.path.join(self.config.data_dir, 'train.csv')
+                if not os.path.exists(train_path):
+                    raise FileNotFoundError(f"Training file not found: {train_path}")
+                
+                with open(train_path, 'r', encoding='utf-8') as f:
+                    delimiter = ',' if ',' in f.readline() else '\t'
 
-            train = pd.read_csv(train_path, sep=delimiter, index_col=False)
+                train = pd.read_csv(train_path, sep=delimiter, index_col=False)
 
             if 'label' not in train.columns:
-                raise ValueError(f"Column 'label' not found in train.csv. Available columns: {train.columns.tolist()}")
+                raise ValueError(f"Column 'label' not found in training data. Available columns: {train.columns.tolist()}")
 
             # Calculate class weights
             class_weights = []
+            # Ensure labels are normalized
+            if 'label' in train.columns:
+                train['label'] = train['label'].apply(lambda x: normalize_label(str(x) if x is not None else None, self.label_list))
+            
             for label in self.label_list:
-                label_count = train[train['label'] == label].shape[0]
+                # Count exact matches (normalized labels should match exactly)
+                label_count = (train['label'] == label).sum()
+                
                 if label_count == 0:
                     logger.warning(
                         f"Label '{label}' not found in training data. Using weight 1.0")
                     class_weights.append(1.0)
                 else:
+                    # Calculate weight: total_samples / samples_with_this_label
                     weight = train.shape[0] / label_count
                     if np.isnan(weight) or np.isinf(weight):
                         logger.warning(
@@ -311,6 +442,7 @@ class FinBert(object):
                         class_weights.append(1.0)
                     else:
                         class_weights.append(weight)
+                        logger.info(f"Label '{label}': {label_count} samples, weight: {weight:.4f}")
 
             self.class_weights = torch.tensor(
                 class_weights, dtype=torch.float32)
@@ -333,6 +465,22 @@ class FinBert(object):
 
         model.to(self.device)
 
+        # Detect model architecture (BERT vs RoBERTa)
+        if hasattr(model, 'bert'):
+            base_model = model.bert
+            model_type = 'bert'
+        elif hasattr(model, 'roberta'):
+            base_model = model.roberta
+            model_type = 'roberta'
+        else:
+            # Try to detect from class name
+            model_class_name = model.__class__.__name__.lower()
+            if 'roberta' in model_class_name:
+                base_model = model.roberta
+                model_type = 'roberta'
+            else:
+                raise ValueError(f"Unsupported model architecture. Expected BERT or RoBERTa, got {model.__class__.__name__}")
+
         # Prepare optimizer
         no_decay = ['bias', 'LayerNorm.bias', 'LayerNorm.weight']
 
@@ -343,44 +491,52 @@ class FinBert(object):
             # apply the discriminative fine-tuning. discrimination rate is governed by dft_rate.
 
             encoder_params = []
-            for i in range(12):
+            # Get number of encoder layers dynamically
+            num_layers = len(base_model.encoder.layer)
+            for i in range(num_layers):
                 encoder_decay = {
-                    'params': [p for n, p in list(model.bert.encoder.layer[i].named_parameters()) if
+                    'params': [p for n, p in list(base_model.encoder.layer[i].named_parameters()) if
                                not any(nd in n for nd in no_decay)],
                     'weight_decay': 0.01,
-                    'lr': lr / (dft_rate ** (12 - i))}
+                    'lr': lr / (dft_rate ** (num_layers - i))}
                 encoder_nodecay = {
-                    'params': [p for n, p in list(model.bert.encoder.layer[i].named_parameters()) if
+                    'params': [p for n, p in list(base_model.encoder.layer[i].named_parameters()) if
                                any(nd in n for nd in no_decay)],
                     'weight_decay': 0.0,
-                    'lr': lr / (dft_rate ** (12 - i))}
+                    'lr': lr / (dft_rate ** (num_layers - i))}
                 encoder_params.append(encoder_decay)
                 encoder_params.append(encoder_nodecay)
 
             optimizer_grouped_parameters = [
-                {'params': [p for n, p in list(model.bert.embeddings.named_parameters()) if
+                {'params': [p for n, p in list(base_model.embeddings.named_parameters()) if
                             not any(nd in n for nd in no_decay)],
                  'weight_decay': 0.01,
-                 'lr': lr / (dft_rate ** 13)},
-                {'params': [p for n, p in list(model.bert.embeddings.named_parameters()) if
+                 'lr': lr / (dft_rate ** (num_layers + 1))},
+                {'params': [p for n, p in list(base_model.embeddings.named_parameters()) if
                             any(nd in n for nd in no_decay)],
                  'weight_decay': 0.0,
-                 'lr': lr / (dft_rate ** 13)},
-                {'params': [p for n, p in list(model.bert.pooler.named_parameters()) if
-                            not any(nd in n for nd in no_decay)],
-                 'weight_decay': 0.01,
-                 'lr': lr},
-                {'params': [p for n, p in list(model.bert.pooler.named_parameters()) if
-                            any(nd in n for nd in no_decay)],
-                 'weight_decay': 0.0,
-                 'lr': lr},
+                 'lr': lr / (dft_rate ** (num_layers + 1))}]
+            
+            # Add pooler parameters if they exist (BERT has pooler, RoBERTa might not)
+            if hasattr(base_model, 'pooler') and base_model.pooler is not None:
+                optimizer_grouped_parameters.extend([
+                    {'params': [p for n, p in list(base_model.pooler.named_parameters()) if
+                                not any(nd in n for nd in no_decay)],
+                     'weight_decay': 0.01,
+                     'lr': lr},
+                    {'params': [p for n, p in list(base_model.pooler.named_parameters()) if
+                                any(nd in n for nd in no_decay)],
+                     'weight_decay': 0.0,
+                     'lr': lr}])
+            
+            optimizer_grouped_parameters.extend([
                 {'params': [p for n, p in list(model.classifier.named_parameters()) if
                             not any(nd in n for nd in no_decay)],
                  'weight_decay': 0.01,
                  'lr': lr},
                 {'params': [p for n, p in list(model.classifier.named_parameters()) if any(nd in n for nd in no_decay)],
                  'weight_decay': 0.0,
-                 'lr': lr}]
+                 'lr': lr}])
 
             optimizer_grouped_parameters.extend(encoder_params)
 
@@ -475,13 +631,73 @@ class FinBert(object):
             The trained model.
         """
 
-        validation_examples = self.get_data('validation')
+        # Try to get validation data, if not available, split training data
+        try:
+            validation_examples = self.get_data('validation')
+            # Check if validation is actually the same as training (fallback was used)
+            # Compare first few examples to detect if they're the same
+            if len(validation_examples) == len(train_examples):
+                # Check if first example is the same (likely same dataset)
+                if (len(train_examples) > 0 and len(validation_examples) > 0 and
+                    train_examples[0].guid == validation_examples[0].guid and
+                    train_examples[0].text == validation_examples[0].text):
+                    # They are the same - split training data
+                    if self.processor._is_hf_dataset_id(self.config.data_dir):
+                        logger.warning(
+                            "Validation split not found. Splitting training data into train/validation (80/20 split)."
+                        )
+                        from sklearn.model_selection import train_test_split
+                        # Split training examples into train and validation
+                        actual_train_examples, validation_examples = train_test_split(
+                            train_examples, 
+                            test_size=0.2, 
+                            random_state=self.config.seed
+                        )
+                        train_examples = actual_train_examples
+                        logger.info(f"Split training data: {len(train_examples)} train, {len(validation_examples)} validation")
+                        # Recalculate num_train_optimization_steps based on the new training data size
+                        self.num_train_optimization_steps = int(
+                            len(train_examples) / self.config.train_batch_size / self.config.gradient_accumulation_steps
+                        ) * self.config.num_train_epochs
+        except ValueError as e:
+            # If validation split doesn't exist and we're using HF dataset, split training data
+            # Check for the specific error message or the error flag
+            is_validation_error = (
+                'Validation split not found' in str(e) or 
+                hasattr(e, '_is_validation_split_error')
+            )
+            if is_validation_error and self.processor._is_hf_dataset_id(self.config.data_dir):
+                logger.warning(
+                    "Validation split not found. Splitting training data into train/validation (80/20 split)."
+                )
+                from sklearn.model_selection import train_test_split
+                # Split training examples into train and validation
+                actual_train_examples, validation_examples = train_test_split(
+                    train_examples, 
+                    test_size=0.2, 
+                    random_state=self.config.seed
+                )
+                train_examples = actual_train_examples
+                logger.info(f"Split training data: {len(train_examples)} train, {len(validation_examples)} validation")
+                # Recalculate num_train_optimization_steps based on the new training data size
+                self.num_train_optimization_steps = int(
+                    len(train_examples) / self.config.train_batch_size / self.config.gradient_accumulation_steps
+                ) * self.config.num_train_epochs
+            else:
+                # Re-raise if it's a different error
+                raise
 
         global_step = 0
         best_model = 0
 
         self.validation_losses = []
         self.training_losses = []
+
+        # Ensure num_train_optimization_steps is set (recalculate if needed)
+        if self.num_train_optimization_steps is None:
+            self.num_train_optimization_steps = int(
+                len(train_examples) / self.config.train_batch_size / self.config.gradient_accumulation_steps
+            ) * self.config.num_train_epochs
 
         # Training
         train_dataloader = self.get_loader(train_examples, 'train')
@@ -493,6 +709,19 @@ class FinBert(object):
                     "Model contains invalid parameters. Check pretrained weights.")
 
         model.train()
+
+        # Detect base model architecture once (for gradual_unfreeze)
+        if hasattr(model, 'bert'):
+            base_model = model.bert
+        elif hasattr(model, 'roberta'):
+            base_model = model.roberta
+        else:
+            # Fallback: try to detect from class name
+            model_class_name = model.__class__.__name__.lower()
+            if 'roberta' in model_class_name:
+                base_model = model.roberta
+            else:
+                raise ValueError(f"Unsupported model architecture. Expected BERT or RoBERTa, got {model.__class__.__name__}")
 
         step_number = len(train_dataloader)
 
@@ -507,7 +736,7 @@ class FinBert(object):
             for step, batch in enumerate(tqdm(train_dataloader, desc='Iteration')):
 
                 if (self.config.gradual_unfreeze and i == 0):
-                    for param in model.bert.parameters():
+                    for param in base_model.parameters():
                         param.requires_grad = False
 
                 if (step % (step_number // 3)) == 0:
@@ -518,13 +747,13 @@ class FinBert(object):
                     for k in range(i - 1):
 
                         try:
-                            for param in model.bert.encoder.layer[self.config.encoder_no - 1 - k].parameters():
+                            for param in base_model.encoder.layer[self.config.encoder_no - 1 - k].parameters():
                                 param.requires_grad = True
                         except:
                             pass
 
                 if (self.config.gradual_unfreeze and i > self.config.encoder_no + 1):
-                    for param in model.bert.embeddings.parameters():
+                    for param in base_model.embeddings.parameters():
                         param.requires_grad = True
 
                 batch = tuple(t.to(self.device) for t in batch)
@@ -744,6 +973,9 @@ def predict(text, model, write_to_csv=False, path=None, use_gpu=False, gpu_name=
         logger.info("Downloading NLTK punkt_tab tokenizer...")
         nltk.download('punkt_tab', quiet=True)
 
+    # Remove URLs from input text
+    text = remove_urls(text)
+    
     sentences = sent_tokenize(text)
 
     if use_gpu:
@@ -762,8 +994,10 @@ def predict(text, model, write_to_csv=False, path=None, use_gpu=False, gpu_name=
     result = pd.DataFrame(
         columns=['sentence', 'logit', 'prediction', 'sentiment_score'])
     for batch in chunks(sentences, batch_size):
+        # Remove URLs from each sentence
+        cleaned_batch = [remove_urls(sentence) for sentence in batch]
         examples = [InputExample(str(i), sentence)
-                    for i, sentence in enumerate(batch)]
+                    for i, sentence in enumerate(cleaned_batch)]
 
         features = convert_examples_to_features(
             examples, label_list, 64, tokenizer)
